@@ -9,6 +9,8 @@ mod id;
 #[cfg(target_os = "linux")]
 pub mod linux;
 mod netmon;
+#[cfg(unix)]
+pub mod polling;
 #[cfg(windows)]
 pub mod windows;
 
@@ -17,6 +19,8 @@ pub use id::{InterfaceId, MonType};
 #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 pub use netmon::PlatformMon;
 pub use netmon::{BoxStream, Netmon, platform_mon};
+#[cfg(unix)]
+pub use polling::PollingMon;
 
 /// An event produced by the network monitor.
 #[derive(Debug, Clone, PartialEq, Eq)]

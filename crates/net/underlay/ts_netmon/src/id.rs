@@ -35,6 +35,12 @@ impl MonType {
     /// [`InterfaceId`]s with this type are interface indices.
     pub const PF_ROUTE: Self = Self::new_static("pf_route");
 
+    /// [`MonType`] for the portable [`PollingMon`][crate::PollingMon], which polls
+    /// `getifaddrs(3)`.
+    ///
+    /// [`InterfaceId`]s with this type are interface indices.
+    pub const POLLING: Self = Self::new_static("polling");
+
     /// Convenience helper to construct a new mon type from a `&'static str`.
     ///
     /// # Panics

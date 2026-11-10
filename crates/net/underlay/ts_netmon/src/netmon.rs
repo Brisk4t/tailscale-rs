@@ -15,10 +15,16 @@ use crate::{Event, Family, InterfaceId, Route, id::MonType};
 pub type BoxStream<T> = Pin<Box<dyn Stream<Item = T> + Send + 'static>>;
 
 /// Get the platform [`Netmon`] implementation if there is one.
+///
+/// On Unix platforms without a dedicated implementation, this is a
+/// [`PollingMon`][crate::PollingMon] polling at the
+/// [default interval][crate::polling::DEFAULT_POLL_INTERVAL].
 pub const fn platform_mon() -> Option<impl Netmon + 'static> {
     cfg_if::cfg_if! {
         if #[cfg(any(windows, target_os = "linux", target_os = "macos"))] {
             Some(&PlatformMon)
+        } else if #[cfg(unix)] {
+            Some(crate::PollingMon::new(crate::polling::DEFAULT_POLL_INTERVAL))
         } else {
             struct NoopMon;
 

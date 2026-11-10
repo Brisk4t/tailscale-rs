@@ -41,6 +41,10 @@ windows = { version = "0.62", features = [
     "Win32_Networking_WinSock",
 ] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+tokio = { workspace = true, features = ["time"] }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 rtnetlink = "0.21"
 

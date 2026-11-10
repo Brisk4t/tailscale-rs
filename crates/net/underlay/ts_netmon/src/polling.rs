@@ -1,0 +1,526 @@
+//! Portable polling network monitor.
+//!
+//! This is the fallback for Unix platforms without a dedicated [`Netmon`] backend
+//! Re-reads the interface state on a timer and reports what changed.
+//!
+//! Each poll takes a snapshot with `getifaddrs(3)`, diffs it against the previous one, and
+//! emits [`Event::InterfaceUpsert`], [`Event::InterfaceRemoved`], [`Event::AddrUpsert`] and
+//! [`Event::AddrRemoved`] for the differences. The first poll happens immediately, so the
+//! stream starts with the full current state.
+//!
+//! - No routes are reported (`getifaddrs` doesn't expose them), so no
+//!   [`Event::DefaultRouteInterface`] is ever derived either.
+//! - [`Interface::mtu`] and [`Interface::hardware_addr`] are always `None`.
+
+use core::{
+    ffi::{CStr, c_int},
+    mem::{MaybeUninit, size_of},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    ptr,
+    time::Duration,
+};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    io,
+};
+
+use futures_util::{StreamExt, stream};
+use ipnet::IpNet;
+
+use crate::{BoxStream, Event, Interface, InterfaceId, MonType, Netmon};
+
+/// How often [`PollingMon::default`] re-reads the interface state.
+pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(10);
+
+/// [`Netmon`] that polls the interface state with `getifaddrs(3)` on a fixed interval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PollingMon {
+    interval: Duration,
+}
+
+impl PollingMon {
+    /// Construct a monitor that polls every `interval`.
+    pub const fn new(interval: Duration) -> Self {
+        Self { interval }
+    }
+
+    /// The interval between polls.
+    pub const fn interval(&self) -> Duration {
+        self.interval
+    }
+}
+
+impl Default for PollingMon {
+    fn default() -> Self {
+        Self::new(DEFAULT_POLL_INTERVAL)
+    }
+}
+
+impl Netmon for PollingMon {
+    fn ty(&self) -> MonType {
+        MonType::POLLING
+    }
+
+    fn event_stream(&self) -> io::Result<BoxStream<io::Result<Event>>> {
+        // State: (interval, whether this is the first poll, last snapshot). The interval lives
+        // in the state rather than being captured, so this can be an async closure.
+        let stream = stream::unfold(
+            (self.interval, true, Snapshot::default()),
+            async |(interval, first, mut state): (Duration, bool, Snapshot)| {
+                // The first poll happens immediately.
+                if !first {
+                    tokio::time::sleep(interval).await;
+                }
+
+                let events = match Snapshot::read() {
+                    Ok(new) => {
+                        let events = state.diff(&new);
+                        if !events.is_empty() {
+                            tracing::trace!(n_events = events.len(), "interface state changed");
+                        }
+                        state = new;
+                        events.into_iter().map(Ok).collect()
+                    }
+                    // Report the error and keep polling: the next poll may succeed.
+                    Err(e) => vec![Err(e)],
+                };
+
+                Some((stream::iter(events), (interval, false, state)))
+            },
+        )
+        .flatten();
+
+        Ok(Box::pin(stream))
+    }
+
+    // Keeps the default `strong_delete_consistency() == true`: `InterfaceRemoved` is emitted
+    // only once the interface is gone, so its addresses are gone with it and aren't
+    // reported individually.
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct Snapshot {
+    interfaces: BTreeMap<InterfaceId, (Interface, BTreeSet<IpNet>)>,
+}
+
+impl Snapshot {
+    /// Read the current state from `getifaddrs(3)`.
+    fn read() -> io::Result<Self> {
+        let ifaddrs = IfAddrs::new()?;
+
+        let mut interfaces = BTreeMap::<InterfaceId, (Interface, BTreeSet<IpNet>)>::new();
+
+        // getifaddrs returns one entry per address (plus one per link on most systems)
+        let mut indices = HashMap::<&CStr, Option<u32>>::new();
+
+        for ifa in ifaddrs.iter() {
+            if ifa.ifa_name.is_null() {
+                continue;
+            }
+
+            let name = unsafe { CStr::from_ptr(ifa.ifa_name) };
+
+            let index = *indices.entry(name).or_insert_with(|| {
+                // SAFETY: `name` is a valid NUL-terminated string.
+                let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
+
+                // 0: the interface disappeared between getifaddrs and this lookup.
+                (index != 0).then_some(index)
+            });
+            let Some(index) = index else {
+                continue;
+            };
+
+            let id = InterfaceId::new(MonType::POLLING, index.into());
+
+            let (_iface, addrs) = interfaces.entry(id.clone()).or_insert_with(|| {
+                (
+                    Interface {
+                        id,
+                        up: ifa.ifa_flags as u64 & libc::IFF_UP as u64 != 0,
+                        name: name.to_string_lossy().into_owned(),
+                        mtu: None,
+                        hardware_addr: None,
+                        metric_v4: 0,
+                        metric_v6: 0,
+                    },
+                    BTreeSet::new(),
+                )
+            });
+
+            // SAFETY: getifaddrs guarantees these are null or valid sockaddrs that live as
+            // long as `ifaddrs`.
+            if let Some(net) = unsafe { ip_net(ifa.ifa_addr, ifa.ifa_netmask) } {
+                addrs.insert(net);
+            }
+        }
+
+        Ok(Self { interfaces })
+    }
+
+    /// Events that turn `self` into `new`.
+    ///
+    /// A removed interface is reported only as [`Event::InterfaceRemoved`], which implies the
+    /// removal of its addresses (see [`Netmon::strong_delete_consistency`]).
+    fn diff(&self, new: &Self) -> Vec<Event> {
+        let mut events = vec![];
+
+        events.extend(
+            self.interfaces
+                .keys()
+                .filter(|id| !new.interfaces.contains_key(id))
+                .map(|id| Event::InterfaceRemoved(id.clone())),
+        );
+
+        for (id, (iface, addrs)) in &new.interfaces {
+            match self.interfaces.get(id) {
+                Some((old_iface, old_addrs)) => {
+                    events.extend(
+                        old_addrs
+                            .difference(addrs)
+                            .map(|&addr| Event::AddrRemoved(id.clone(), addr)),
+                    );
+
+                    if old_iface != iface {
+                        events.push(Event::InterfaceUpsert(iface.clone()));
+                    }
+
+                    events.extend(
+                        addrs
+                            .difference(old_addrs)
+                            .map(|&addr| Event::AddrUpsert(id.clone(), addr)),
+                    );
+                }
+                None => {
+                    events.push(Event::InterfaceUpsert(iface.clone()));
+                    events.extend(
+                        addrs
+                            .iter()
+                            .map(|&addr| Event::AddrUpsert(id.clone(), addr)),
+                    );
+                }
+            }
+        }
+
+        events
+    }
+}
+
+/// Owner of a `getifaddrs(3)` list; frees it on drop.
+struct IfAddrs(*mut libc::ifaddrs);
+
+impl IfAddrs {
+    fn new() -> io::Result<Self> {
+        let mut head = ptr::null_mut();
+
+        // SAFETY: `head` is a valid out-pointer.
+        if unsafe { libc::getifaddrs(&mut head) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(Self(head))
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &libc::ifaddrs> {
+        // SAFETY: every node in the list is valid until `freeifaddrs`, which only runs when
+        // `self` is dropped, and the returned references borrow `self`.
+        core::iter::successors(unsafe { self.0.as_ref() }, |ifa| unsafe {
+            ifa.ifa_next.as_ref()
+        })
+    }
+}
+
+impl Drop for IfAddrs {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: `self.0` came from a successful `getifaddrs` and is freed only here.
+            unsafe { libc::freeifaddrs(self.0) };
+        }
+    }
+}
+
+/// Convert a `getifaddrs` address and netmask to an [`IpNet`].
+///
+/// Returns `None` for null addresses and non-IP address families (link-layer entries).
+/// A null netmask means a host prefix (/32 or /128).
+///
+/// # Safety
+///
+/// `addr` and `mask` must each be null or point to a valid `sockaddr`.
+unsafe fn ip_net(addr: *const libc::sockaddr, mask: *const libc::sockaddr) -> Option<IpNet> {
+    if addr.is_null() {
+        return None;
+    }
+
+    // SAFETY: `addr` is non-null and valid per the caller.
+    let family = c_int::from(unsafe { (*addr).sa_family });
+
+    // The mask's own family may be unset (BSD), so it's interpreted using the address's
+    // family.
+    let (ip, mask) = match family {
+        libc::AF_INET => {
+            // SAFETY: `addr` is a valid sockaddr of family AF_INET.
+            let sin = unsafe { read_sockaddr::<libc::sockaddr_in>(addr) };
+            let ip = Ipv4Addr::from(sin.sin_addr.s_addr.to_ne_bytes());
+
+            let mask = if mask.is_null() {
+                Ipv4Addr::BROADCAST
+            } else {
+                // SAFETY: `mask` is non-null and valid per the caller.
+                let m = unsafe { read_sockaddr::<libc::sockaddr_in>(mask) };
+                Ipv4Addr::from(m.sin_addr.s_addr.to_ne_bytes())
+            };
+
+            (IpAddr::V4(ip), IpAddr::V4(mask))
+        }
+        libc::AF_INET6 => {
+            // SAFETY: `addr` is a valid sockaddr of family AF_INET6.
+            let sin6 = unsafe { read_sockaddr::<libc::sockaddr_in6>(addr) };
+            let ip = strip_embedded_scope(Ipv6Addr::from(sin6.sin6_addr.s6_addr));
+
+            let mask = if mask.is_null() {
+                Ipv6Addr::from_bits(u128::MAX)
+            } else {
+                // SAFETY: as above.
+                let m = unsafe { read_sockaddr::<libc::sockaddr_in6>(mask) };
+                Ipv6Addr::from(m.sin6_addr.s6_addr)
+            };
+
+            (IpAddr::V6(ip), IpAddr::V6(mask))
+        }
+        _ => return None,
+    };
+
+    // Fails (and the address is skipped) if the mask isn't contiguous.
+    IpNet::with_netmask(ip, mask).ok()
+}
+
+/// Copy a `T` (a concrete sockaddr type) out of `sa`.
+///
+/// On platforms whose `sockaddr` has `sa_len`, only `sa_len` bytes are read and the rest is
+/// zero: BSD-derived kernels hand out truncated netmasks (e.g. 5 bytes for `255.0.0.0`), and
+/// reading a full `sockaddr_in` from those would run past the entry.
+///
+/// # Safety
+///
+/// `sa` must point to a valid `sockaddr`. Without `sa_len`, it must be at least
+/// `size_of::<T>()` bytes long.
+unsafe fn read_sockaddr<T: Copy>(sa: *const libc::sockaddr) -> T {
+    // SAFETY: `sa` is valid per the caller.
+    let len = unsafe { sa_len(sa) }.map_or(size_of::<T>(), |len| len.min(size_of::<T>()));
+
+    let mut out = MaybeUninit::<T>::zeroed();
+
+    // SAFETY: `sa` has at least `len` readable bytes (see above), `out` has room for
+    // `size_of::<T>() >= len` bytes, and they don't overlap.
+    unsafe { ptr::copy_nonoverlapping(sa.cast::<u8>(), out.as_mut_ptr().cast::<u8>(), len) };
+
+    // SAFETY: `T` is a plain C sockaddr struct, for which all-zero (and any partial copy over
+    // zero) is a valid value.
+    unsafe { out.assume_init() }
+}
+
+cfg_if::cfg_if! {
+    // Platforms whose `sockaddr` starts with a length byte.
+    if #[cfg(any(
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "nto",
+        target_os = "qnx",
+        target_os = "haiku",
+        target_os = "aix",
+        target_os = "hurd",
+    ))] {
+        unsafe fn sa_len(sa: *const libc::sockaddr) -> Option<usize> {
+            // SAFETY: `sa` is valid per the caller.
+            Some(usize::from(unsafe { (*sa).sa_len }))
+        }
+
+        #[cfg(test)]
+        fn set_sin_len(sa: &mut libc::sockaddr_in) {
+            sa.sin_len = size_of::<libc::sockaddr_in>() as _;
+        }
+    } else {
+        /// This platform's `sockaddr` has no `sa_len`.
+        unsafe fn sa_len(_sa: *const libc::sockaddr) -> Option<usize> {
+            None
+        }
+
+        #[cfg(test)]
+        fn set_sin_len(_sa: &mut libc::sockaddr_in) {}
+    }
+}
+
+/// Clear the interface index that BSD-derived kernels (KAME) embed in bytes 2–3 of IPv6
+/// link-local addresses, e.g. `fe80:2::1` → `fe80::1`.
+///
+/// Those bytes are always zero in a real link-local address, so this is a no-op elsewhere.
+fn strip_embedded_scope(ip: Ipv6Addr) -> Ipv6Addr {
+    if !ip.is_unicast_link_local() {
+        return ip;
+    }
+
+    let mut segments = ip.segments();
+    segments[1] = 0;
+    Ipv6Addr::from(segments)
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    fn id(index: u64) -> InterfaceId {
+        InterfaceId::new(MonType::POLLING, index)
+    }
+
+    fn iface(index: u64, name: &str, up: bool) -> Interface {
+        Interface {
+            id: id(index),
+            up,
+            name: name.to_owned(),
+            mtu: None,
+            hardware_addr: None,
+            metric_v4: 0,
+            metric_v6: 0,
+        }
+    }
+
+    fn net(s: &str) -> IpNet {
+        s.parse().unwrap()
+    }
+
+    fn snapshot(entries: &[(Interface, &[&str])]) -> Snapshot {
+        Snapshot {
+            interfaces: entries
+                .iter()
+                .map(|(iface, addrs)| {
+                    (
+                        iface.id.clone(),
+                        (iface.clone(), addrs.iter().map(|a| net(a)).collect()),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn diff_from_empty_reports_everything() {
+        let eth = iface(2, "eth0", true);
+        let new = snapshot(&[(eth.clone(), &["192.168.1.5/24", "fe80::1/64"])]);
+
+        assert_eq!(
+            Snapshot::default().diff(&new),
+            vec![
+                Event::InterfaceUpsert(eth),
+                Event::AddrUpsert(id(2), net("192.168.1.5/24")),
+                Event::AddrUpsert(id(2), net("fe80::1/64")),
+            ]
+        );
+    }
+
+    #[test]
+    fn diff_unchanged_is_empty() {
+        let s = snapshot(&[(iface(2, "eth0", true), &["192.168.1.5/24"])]);
+        assert_eq!(s.diff(&s.clone()), vec![]);
+    }
+
+    #[test]
+    fn diff_address_changes() {
+        let eth = iface(2, "eth0", true);
+        let old = snapshot(&[(eth.clone(), &["192.168.1.5/24", "10.0.0.1/8"])]);
+        let new = snapshot(&[(eth, &["192.168.1.5/16", "10.0.0.1/8"])]);
+
+        // Prefix change: removal first, then the new prefix.
+        assert_eq!(
+            old.diff(&new),
+            vec![
+                Event::AddrRemoved(id(2), net("192.168.1.5/24")),
+                Event::AddrUpsert(id(2), net("192.168.1.5/16")),
+            ]
+        );
+    }
+
+    #[test]
+    fn diff_interface_down_and_removed() {
+        let lo = iface(1, "lo0", true);
+        let eth = iface(2, "eth0", true);
+        let old = snapshot(&[(lo.clone(), &["127.0.0.1/8"]), (eth, &["192.168.1.5/24"])]);
+        let lo_down = iface(1, "lo0", false);
+        let new = snapshot(&[(lo_down.clone(), &["127.0.0.1/8"])]);
+
+        assert_eq!(
+            old.diff(&new),
+            vec![
+                Event::InterfaceRemoved(id(2)),
+                Event::InterfaceUpsert(lo_down),
+            ]
+        );
+    }
+
+    #[test]
+    fn embedded_scope_is_stripped() {
+        let kame: Ipv6Addr = "fe80:2::1".parse().unwrap();
+        assert_eq!(
+            strip_embedded_scope(kame),
+            "fe80::1".parse::<Ipv6Addr>().unwrap()
+        );
+
+        let global: Ipv6Addr = "2001:db8:2::1".parse().unwrap();
+        assert_eq!(strip_embedded_scope(global), global);
+    }
+
+    #[test]
+    fn ipv4_from_sockaddrs() {
+        // SAFETY: all-zero is a valid sockaddr_in.
+        let mut addr: libc::sockaddr_in = unsafe { core::mem::zeroed() };
+        addr.sin_family = libc::AF_INET as _;
+        addr.sin_addr.s_addr = u32::from_ne_bytes([192, 168, 1, 5]);
+        let mut mask = addr;
+        mask.sin_addr.s_addr = u32::from_ne_bytes([255, 255, 255, 0]);
+        set_sin_len(&mut addr);
+        set_sin_len(&mut mask);
+
+        let addr_ptr = (&raw const addr).cast::<libc::sockaddr>();
+        let mask_ptr = (&raw const mask).cast::<libc::sockaddr>();
+
+        // SAFETY: both point to valid sockaddr_in values.
+        unsafe {
+            assert_eq!(ip_net(addr_ptr, mask_ptr), Some(net("192.168.1.5/24")));
+            assert_eq!(ip_net(addr_ptr, ptr::null()), Some(net("192.168.1.5/32")));
+            assert_eq!(ip_net(ptr::null(), mask_ptr), None);
+        }
+
+        // Non-contiguous masks are rejected.
+        mask.sin_addr.s_addr = u32::from_ne_bytes([255, 0, 255, 0]);
+        let mask_ptr = (&raw const mask).cast::<libc::sockaddr>();
+        // SAFETY: as above.
+        assert_eq!(unsafe { ip_net(addr_ptr, mask_ptr) }, None);
+    }
+
+    /// Every Unix system has a loopback interface with 127.0.0.1/8 that's up.
+    #[test]
+    fn read_finds_loopback() {
+        let snapshot = Snapshot::read().unwrap();
+
+        let loopback = snapshot
+            .interfaces
+            .values()
+            .find(|(_iface, addrs)| addrs.contains(&net("127.0.0.1/8")));
+
+        let (iface, _addrs) = loopback.expect("no interface with 127.0.0.1/8");
+        assert!(iface.up, "{iface:?}");
+        assert_eq!(iface.id.ty(), &MonType::POLLING);
+    }
+
+    #[tokio::test]
+    async fn stream_reports_initial_state_immediately() {
+        let mon = PollingMon::new(Duration::from_secs(3600));
+        let mut stream = mon.event_stream().unwrap();
+
+        let first = stream.next().await.unwrap().unwrap();
+        assert!(matches!(first, Event::InterfaceUpsert(_)), "{first:?}");
+    }
+}
